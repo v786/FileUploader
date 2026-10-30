@@ -1,0 +1,14 @@
+# Rate limits. Re-read on change (mtime checked), so edits apply without a restart.
+# rate = tokens per second refilled, burst = bucket capacity.
+inbound:
+  api:            { rate: 20,      burst: 60 }      # per user, 20 req/s burst 60
+  part_signing:   { rate: 8.3333,  burst: 500 }     # per user, 500 parts/min
+  batch_creation: { rate: 0.16667, burst: 10 }      # per user, 10 batches/min
+outbound:
+  scanner:
+    - { rate: 50, burst: 100 }                       # 50 req/s, burst 100
+  extractor:
+    - { rate: 10, burst: 10 }                        # 10 req/s
+    - { rate: 0.27778, burst: 1000, name: hourly }   # 1,000/hour
+  thumbnailer:
+    - { rate: 30, burst: 30 }                        # 30 req/s
