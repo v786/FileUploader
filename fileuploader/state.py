@@ -9,11 +9,11 @@ from __future__ import annotations
 
 import sqlite3
 
-from . import clock
+from . import clock, estimates, events
 from .events import FINAL
 
-STAGES = ("scan", "extract", "thumbnail", "finalize")
-STAGE_WEIGHT = {"scan": 30, "extract": 30, "thumbnail": 30, "finalize": 10}
+STAGES = ("scan", "extract", "thumbnail", "process", "finalize")
+FAN_IN = ("extract", "thumbnail", "process")  # finalize waits for all three
 
 TRANSITIONS: dict[str, set[str]] = {
     "pending": {"uploading", "completed", "failed", "cancelled"},
@@ -53,9 +53,8 @@ def transition(conn: sqlite3.Connection, f: sqlite3.Row, to: str, **fields) -> b
 
 
 def progress(conn: sqlite3.Connection, file_id: str) -> float:
-    done = [r["stage"] for r in conn.execute("SELECT stage FROM jobs WHERE file_id = ? AND status = 'done'",
-                                             (file_id,))]
-    return float(sum(STAGE_WEIGHT[s] for s in done))
+    """processing_pct of an uploaded file (see estimates.processing_pct)."""
+    return estimates.processing_pct(conn, get_file(conn, file_id))
 
 
 def derive_processing_status(conn: sqlite3.Connection, file_id: str) -> str:
@@ -63,7 +62,7 @@ def derive_processing_status(conn: sqlite3.Connection, file_id: str) -> str:
     jobs = conn.execute("SELECT status, attempt FROM jobs WHERE file_id = ?", (file_id,)).fetchall()
     if any(j["status"] == "waiting_vendor" for j in jobs):
         return "waiting_vendor"
-    if any(j["status"] == "queued" and j["attempt"] > 0 for j in jobs):
+    if any(j["status"] == "queued" and j["attempt"] > 0 for j in jobs):  # waiting out a backoff
         return "failed_retryable"
     return "processing"
 
@@ -77,3 +76,22 @@ def sync_status(conn: sqlite3.Connection, file_id: str, **fields) -> sqlite3.Row
     fields.setdefault("progress_pct", progress(conn, file_id))
     transition(conn, f, to, **fields)
     return get_file(conn, file_id)
+
+
+def emit_stage(conn: sqlite3.Connection, f: sqlite3.Row, stage: str, **extra) -> None:
+    """file.stage: the bar's processing segment is `processing_pct`."""
+    events.emit(conn, f["batch_id"], "file.stage",
+                {"file_id": f["id"], "stage": stage, "progress_pct": f["progress_pct"],
+                 "processing_pct": f["progress_pct"] if f["uploaded_at"] is not None else 0.0, **extra}, f["id"])
+
+
+def requeue(conn: sqlite3.Connection, where: str, args: tuple) -> None:
+    """Re-queue jobs with fresh attempts (user retry, DLQ replay). A process job that failed
+    or died gets a new generation, so it submits a new vendor job instead of finding the old one."""
+    now = clock.now()
+    conn.execute(
+        f"UPDATE jobs SET generation = generation + 1, vendor_job_id = NULL, vendor_status = NULL, "
+        f"vendor_progress = NULL, vendor_queue_position = NULL, vendor_updated_at = NULL, submitted_at = NULL, "
+        f"polls = 0 WHERE stage = 'process' AND status IN ('failed', 'dead') AND {where}", args)
+    conn.execute(f"UPDATE jobs SET status = 'queued', attempt = 0, next_run_at = ?, locked_until = NULL, "
+                 f"lease_id = NULL, updated_at = ? WHERE {where}", (now, now, *args))

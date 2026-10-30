@@ -62,7 +62,8 @@ async def upload_file(api: httpx.AsyncClient, s3: httpx.AsyncClient, f: dict, pa
     if f["status"] != "pending" and f["status"] != "uploading":
         print(f"  {f['name']}: {f['status']} (no upload needed)")
         return
-    info = (await request(api, "POST", f"/files/{fid}/multipart")).json()
+    # POST /batches already started the upload and signed its first parts.
+    info = f["upload"].get("start") or (await request(api, "POST", f"/files/{fid}/multipart")).json()
     if info["mode"] == "single":
         with open(path, "rb") as fh:
             await put_part(s3, info["url"], fh.read())
@@ -81,8 +82,12 @@ async def upload_file(api: httpx.AsyncClient, s3: httpx.AsyncClient, f: dict, pa
                 r = await request(api, "POST", f"/files/{fid}/parts/{n}", json={"etag": etag, "size_bytes": len(data)})
                 print(f"  {f['name']}: part {n}/{info['part_count']} — {r.json()['progress_pct']:.0f}% uploaded")
 
-        for i in range(0, len(missing), 100):  # sign in pages of up to 100
-            page = missing[i:i + 100]
+        presigned = info.get("urls", {})
+        first = [n for n in missing if str(n) in presigned]
+        await asyncio.gather(*(one(n, presigned[str(n)]) for n in first))
+        rest = [n for n in missing if str(n) not in presigned]
+        for i in range(0, len(rest), 100):  # sign in pages of up to 100
+            page = rest[i:i + 100]
             urls = (await request(api, "POST", f"/files/{fid}/parts:sign", json={"part_numbers": page})).json()["urls"]
             await asyncio.gather(*(one(n, urls[str(n)]) for n in page))
     r = await request(api, "POST", f"/files/{fid}/complete")

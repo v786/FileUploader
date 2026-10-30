@@ -2,6 +2,10 @@
 
 idempotency cache check -> breaker check -> (retry budget) -> rate-limit token
 -> timeout -> call -> classify error -> record breaker outcome -> cache result
+
+Status polls pass `cache=False` (each poll must really ask) and their own rate-limit
+`bucket`, so polls can never use up the submit quota; they still share the vendor's
+breaker.
 """
 from __future__ import annotations
 
@@ -27,10 +31,13 @@ def cached(key: str) -> dict | None:
 
 
 async def call_vendor(vendor: str, key: str, fn: Callable[[], Awaitable[dict]], *,
-                      timeout_s: float, is_retry: bool = False, request: Any = None) -> dict:
-    hit = cached(key)
-    if hit is not None:
-        return hit
+                      timeout_s: float, is_retry: bool = False, request: Any = None,
+                      bucket: str | None = None, cache: bool = True) -> dict:
+    if cache:
+        hit = cached(key)
+        if hit is not None:
+            return hit
+    bucket = bucket or vendor
 
     permit = breaker.before_call(vendor)  # raises BreakerOpen
 
@@ -38,10 +45,10 @@ async def call_vendor(vendor: str, key: str, fn: Callable[[], Awaitable[dict]], 
         breaker.release(permit)
         raise RetryBudgetExceeded(vendor, wait_s=1.0)
 
-    wait = ratelimit.acquire_vendor(vendor)
+    wait = ratelimit.acquire_vendor(bucket)
     if wait > 0:
         breaker.release(permit)
-        raise RateLimited(vendor, wait)
+        raise RateLimited(bucket, wait)
 
     try:
         result = await asyncio.wait_for(fn(), timeout=timeout_s)
@@ -53,10 +60,12 @@ async def call_vendor(vendor: str, key: str, fn: Callable[[], Awaitable[dict]], 
         transient = is_transient_vendor_error(exc)
         breaker.record(permit, ok=False, counts=transient, is_retry=is_retry)
         if isinstance(exc, VendorHTTPError) and exc.status == 429:
-            ratelimit.drain([], exc.retry_after_s or 1.0, ratelimit.vendor_specs(vendor))
+            ratelimit.drain([], exc.retry_after_s or 1.0, ratelimit.vendor_specs(bucket))
         log("vendor.error", vendor=vendor, error=str(exc), transient=transient)
         raise
     breaker.record(permit, ok=True, is_retry=is_retry)
+    if not cache:
+        return result
 
     with db.tx() as conn:
         conn.execute(

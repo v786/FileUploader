@@ -31,6 +31,8 @@ class Settings:
     storage_dir: str = field(default_factory=lambda: _env("STORAGE_DIR", str(ROOT / "data" / "objects")))
     public_base_url: str = field(default_factory=lambda: _env("PUBLIC_BASE_URL", "http://localhost:8000"))
     signing_secret: str = field(default_factory=lambda: _env("SIGNING_SECRET", "dev-secret-change-me"))
+    processor_webhook_secret: str = field(
+        default_factory=lambda: _env("PROCESSOR_WEBHOOK_SECRET", "dev-webhook-secret-change-me"))
     vendor_mode: str = field(default_factory=lambda: _env("VENDOR_MODE", "mock"))
     limits_path: str = field(default_factory=lambda: _env("LIMITS_PATH", str(ROOT / "config" / "limits.yaml")))
     bucket: str = "uploads"
@@ -38,9 +40,14 @@ class Settings:
     # Upload limits
     max_files_per_batch: int = 50
     max_file_size: int = 5 * GB
-    chunk_size: int = 8 * MB
+    chunk_size: int = 8 * MB          # default part size; files smaller than this use one PUT
+    min_part_size: int = 5 * MB       # bounds for a client-chosen (adaptive) part size
+    max_part_size: int = 64 * MB
+    max_parts: int = 10_000
     max_sign_page: int = 100
     presign_ttl_s: int = 15 * 60
+    initial_signed_parts: int = 8     # URLs returned by POST /batches so the first bytes move at once
+    user_quota_bytes: int = 200 * GB
     allowed_extensions: tuple[str, ...] = (
         ".pdf", ".png", ".jpg", ".jpeg", ".gif", ".webp", ".txt", ".csv",
         ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx", ".zip", ".mp4", ".mov", ".json",
@@ -51,11 +58,25 @@ class Settings:
         "scan": StageConfig("scanner", 8, 30.0),
         "extract": StageConfig("extractor", 4, 60.0),
         "thumbnail": StageConfig("thumbnailer", 6, 45.0),
+        "process": StageConfig("processor", 8, 10.0),  # timeout per submit / poll call
         "finalize": StageConfig(None, 16, 5.0),
+    })
+    # p50 per stage until real samples exist (seconds)
+    stage_p50_prior_s: dict[str, float] = field(default_factory=lambda: {
+        "scan": 5.0, "extract": 8.0, "thumbnail": 4.0, "process": 20.0, "finalize": 0.5,
     })
     max_active_jobs_per_user: int = 10
     queue_high_water: int = 5000
     job_lock_s: float = 60.0  # stalled-job check: lease length
+
+    # External processing API (async job + webhook)
+    process_parallel_with_scan: bool = field(
+        default_factory=lambda: _env("PROCESS_PARALLEL_WITH_SCAN", "0") == "1")  # only for a trusted vendor
+    process_deadline_s: float = 15 * 60.0
+    process_source_url_ttl_s: int = 3600
+    process_poll_initial_s: float = 10.0
+    process_poll_max_s: float = 60.0
+    watch_ttl_s: float = 30.0  # a batch with an open SSE stream counts as watched for this long
 
     # Retries
     max_attempts: int = 6

@@ -21,6 +21,9 @@ class Kind(str, enum.Enum):
 CODES: dict[str, tuple[str, bool]] = {
     "FILE_TOO_LARGE": ("This file is larger than the 5 GB limit.", False),
     "UNSUPPORTED_TYPE": ("This file type isn't supported.", False),
+    "TYPE_MISMATCH": ("This file's contents don't match its type.", False),
+    "DUPLICATE_NAME": ("Another file in this upload has the same name.", False),
+    "QUOTA_EXCEEDED": ("This file would take you over your storage quota.", False),
     "TOO_MANY_FILES": ("You can upload up to 50 files at once.", False),
     "CHECKSUM_MISMATCH": ("The uploaded file didn't match the original. Please try again.", True),
     "SIZE_MISMATCH": ("The uploaded file size didn't match. Please try again.", True),
@@ -32,6 +35,9 @@ CODES: dict[str, tuple[str, bool]] = {
     "INTERNAL_ERROR": ("Something went wrong on our side; we've been notified.", True),
     "UPLOAD_EXPIRED": ("This upload was idle too long. Please select the file again.", True),
     "UPLOAD_INCOMPLETE": ("Some parts of this file haven't been uploaded yet.", True),
+    "UPLOAD_REQUIRED": ("This file isn't a duplicate after all; please upload it.", True),
+    "PROCESSING_FAILED": ("The processing service couldn't process this file.", True),
+    "INVALID_SIGNATURE": ("Invalid webhook signature.", False),
     "RATE_LIMITED": ("Too many requests. Please slow down.", True),
     "BUSY": ("Busy — your upload will start shortly.", True),
     "IDEMPOTENCY_KEY_REUSED": ("This request key was already used with different data.", False),
@@ -43,6 +49,31 @@ CODES: dict[str, tuple[str, bool]] = {
     "VALIDATION_ERROR": ("The request was invalid.", False),
     "UNAUTHENTICATED": ("Missing user identity.", False),
 }
+
+
+# The exact fix a failed file offers, so the user can repair it in place.
+FIXES: dict[str, tuple[str, str]] = {
+    "UNSUPPORTED_TYPE": ("convert", "Convert to PDF"),
+    "TYPE_MISMATCH": ("replace", "Replace file"),
+    "FILE_TOO_LARGE": ("split", "Split into parts under 5 GB"),
+    "DUPLICATE_NAME": ("rename", "Rename file"),
+    "QUOTA_EXCEEDED": ("free_space", "Free up space"),
+    "CORRUPT_FILE": ("replace", "Replace file"),
+    "MALWARE_DETECTED": ("remove", "Remove"),
+    "CHECKSUM_MISMATCH": ("retry", "Retry upload"),
+    "SIZE_MISMATCH": ("retry", "Retry upload"),
+    "UPLOAD_EXPIRED": ("retry", "Retry upload"),
+}
+
+# Vendor 4xx codes that are our side's transient problem, not the file's.
+TRANSIENT_VENDOR_CODES = {"SOURCE_URL_EXPIRED"}
+
+
+def fix_for(code: str) -> dict | None:
+    if code in FIXES:
+        action, label = FIXES[code]
+        return {"action": action, "label": label}
+    return {"action": "retry", "label": "Retry"} if retryable_by_user(code) else None
 
 
 def message_for(code: str) -> str:
@@ -149,6 +180,8 @@ def classify(exc: BaseException) -> StageError:
         if exc.status >= 500:
             return StageError(Kind.TRANSIENT, "VENDOR_5XX", str(exc.status))
         code = exc.body.get("code") if isinstance(exc.body, dict) else None
+        if code in TRANSIENT_VENDOR_CODES:  # e.g. a presigned URL expired in a backlog: re-sign and retry
+            return StageError(Kind.TRANSIENT, code, f"{exc.status} {exc.body}")
         if code not in CODES:
             code = "VENDOR_REJECTED"
         return StageError(Kind.PERMANENT, code, f"{exc.status} {exc.body}")

@@ -28,3 +28,10 @@ class Extractor(Protocol):
 
 class Thumbnailer(Protocol):
     async def thumbnail(self, *, file_id: str, key: str, name: str, idempotency_key: str) -> dict: ...
+
+
+class Processor(Protocol):
+    """External processing API, async job model: submit returns a job id; completion
+    arrives by webhook, with status polls as the fallback."""
+    async def submit(self, *, file_id: str, name: str, source_url: str, idempotency_key: str) -> dict: ...
+    async def status(self, *, job_id: str) -> dict: ...

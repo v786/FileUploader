@@ -40,14 +40,12 @@ def replay_dlq(stage: str):
             f = state.get_file(conn, r["file_id"])
             if job is None or job["status"] != "dead" or f["status"] in ("completed", "cancelled"):
                 continue
-            conn.execute("UPDATE jobs SET status='queued', attempt=0, next_run_at=?, lease_id=NULL, "
-                         "locked_until=NULL, updated_at=? WHERE id=?", (now, now, job["id"]))
+            state.requeue(conn, "id = ?", (job["id"],))
             conn.execute("UPDATE jobs SET status='queued', next_run_at=?, updated_at=? "
                          "WHERE file_id=? AND status='skipped'", (now, now, f["id"]))
             if f["status"] == "failed":
                 state.transition(conn, f, "processing", error_code=None, error_message=None, retryable_by_user=0)
-                events.emit(conn, f["batch_id"], "file.stage",
-                            {"file_id": f["id"], "stage": stage, "progress_pct": f["progress_pct"]}, f["id"])
+                state.emit_stage(conn, state.get_file(conn, f["id"]), stage)
                 events.emit_summary(conn, f["batch_id"])
             replayed += 1
     log("dlq.replay", stage=stage, replayed=replayed)
@@ -64,10 +62,12 @@ def metrics():
     now = clock.now()
     with db.read() as conn:
         queues = {r["stage"]: {"waiting": r["waiting"], "running": r["running"], "parked": r["parked"],
+                               "polling_vendor": r["polling"],
                                "oldest_waiting_age_s": round(now - r["oldest"], 1) if r["oldest"] else 0}
                   for r in conn.execute(
                       "SELECT stage, SUM(status='queued') AS waiting, SUM(status='running') AS running, "
-                      "SUM(status='waiting_vendor') AS parked, MIN(CASE WHEN status='queued' THEN created_at END) "
+                      "SUM(status='waiting_vendor') AS parked, SUM(status='polling') AS polling, "
+                      "MIN(CASE WHEN status='queued' THEN created_at END) "
                       "AS oldest FROM jobs GROUP BY stage")}
         outcomes = {r["k"]: r["n"] for r in conn.execute(
             "SELECT CASE WHEN status='failed' THEN 'failed:' || COALESCE(error_code, '?') ELSE status END AS k, "

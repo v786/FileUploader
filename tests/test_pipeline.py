@@ -4,10 +4,11 @@ import json
 
 from fileuploader import adapters, breaker, db, events, worker
 from fileuploader.adapters.vendors import EICAR
-from tests.conftest import TEST_LIMITS, spec
+from tests.conftest import TEST_LIMITS, spec, typed
 
 
 def _uploaded(env, names_data: list[tuple[str, bytes]]) -> list[dict]:
+    names_data = [(n, typed(n, d)) for n, d in names_data]
     files = env.create_batch([spec(n, d) for n, d in names_data])["files"]
     for f, (_, d) in zip(files, names_data):
         assert env.upload(f, d).status_code == 200
@@ -161,7 +162,7 @@ def test_every_job_run_twice_has_no_duplicate_effects(env):
     f = _uploaded(env, [("twice.pdf", b"t" * 300)])[0]
     env.drain()
     vendors = adapters.get()
-    calls = (vendors.scanner.calls, vendors.extractor.calls, vendors.thumbnailer.calls)
+    calls = (vendors.scanner.calls, vendors.extractor.calls, vendors.thumbnailer.calls, vendors.processor.calls)
     with db.read() as conn:
         seq_before = conn.execute("SELECT last_seq FROM batches WHERE id = ?", (f["batch_id"],)).fetchone()[0]
 
@@ -171,10 +172,11 @@ def test_every_job_run_twice_has_no_duplicate_effects(env):
         conn.execute("UPDATE outbox SET published_at = NULL")
     env.drain()
 
-    assert (vendors.scanner.calls, vendors.extractor.calls, vendors.thumbnailer.calls) == calls
+    assert (vendors.scanner.calls, vendors.extractor.calls, vendors.thumbnailer.calls,
+            vendors.processor.calls) == calls
     with db.read() as conn:
-        assert conn.execute("SELECT COUNT(*) FROM jobs WHERE file_id = ?", (f["id"],)).fetchone()[0] == 4
-        assert conn.execute("SELECT COUNT(*) FROM vendor_calls").fetchone()[0] == 3
+        assert conn.execute("SELECT COUNT(*) FROM jobs WHERE file_id = ?", (f["id"],)).fetchone()[0] == 5
+        assert conn.execute("SELECT COUNT(*) FROM vendor_calls").fetchone()[0] == 4
         assert conn.execute("SELECT status FROM files WHERE id = ?", (f["id"],)).fetchone()[0] == "completed"
         # Duplicate events got no new seqs; replays of the outbox were no-ops.
         assert conn.execute("SELECT last_seq FROM batches WHERE id = ?", (f["batch_id"],)).fetchone()[0] == seq_before
@@ -184,7 +186,7 @@ def test_every_job_run_twice_has_no_duplicate_effects(env):
 
 def test_fan_in_enqueues_finalize_once(env):
     f = _uploaded(env, [("fan.png", b"f" * 64)])[0]
-    env.run()
+    env.drain()
     with db.read() as conn:
         rows = conn.execute("SELECT payload FROM outbox WHERE topic = 'enqueue'").fetchall()
     finals = [r for r in rows if json.loads(r["payload"])["stage"] == "finalize"]

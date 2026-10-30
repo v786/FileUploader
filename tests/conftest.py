@@ -24,6 +24,8 @@ TEST_LIMITS = {
         "scanner": [{"rate": 1000, "burst": 1000}],
         "extractor": [{"rate": 1000, "burst": 1000}],
         "thumbnailer": [{"rate": 1000, "burst": 1000}],
+        "processor": [{"rate": 1000, "burst": 1000}],
+        "processor_poll": [{"rate": 1000, "burst": 1000}],
     },
 }
 
@@ -86,8 +88,8 @@ class Env:
         for _ in range(rounds):
             self.run()
             with db.read() as conn:
-                left = conn.execute("SELECT COUNT(*) FROM jobs WHERE status IN ('queued','waiting_vendor','running')"
-                                    ).fetchone()[0]
+                left = conn.execute("SELECT COUNT(*) FROM jobs WHERE status IN "
+                                    "('queued','waiting_vendor','running','polling')").fetchone()[0]
                 outbox = conn.execute("SELECT COUNT(*) FROM outbox WHERE published_at IS NULL").fetchone()[0]
             if left == 0 and outbox == 0:
                 return
@@ -101,6 +103,12 @@ class Env:
         assert self.client.post(f"/__faults/{vendor}", json=profile).status_code == 200
 
 
+def typed(name: str, data: bytes = b"") -> bytes:
+    """Bytes whose magic matches the extension: type is checked by content, not by name."""
+    from fileuploader.filetypes import MAGIC, ext
+    return MAGIC.get(ext(name), (b"",))[0] + data
+
+
 def spec(name: str, data: bytes, cid: str | None = None) -> dict:
     return {"client_file_id": cid or name, "name": name, "size_bytes": len(data),
             "sha256": hashlib.sha256(data).hexdigest()}
@@ -108,7 +116,7 @@ def spec(name: str, data: bytes, cid: str | None = None) -> dict:
 
 @pytest.fixture
 def env(tmp_path: Path, monkeypatch):
-    for v in ("SCANNER", "EXTRACTOR", "THUMBNAILER"):
+    for v in ("SCANNER", "EXTRACTOR", "THUMBNAILER", "PROCESSOR"):
         monkeypatch.delenv(f"MOCK_{v}_FAULTS", raising=False)
     random.seed(1234)
     limits = tmp_path / "limits.yaml"
@@ -116,6 +124,7 @@ def env(tmp_path: Path, monkeypatch):
     s = Settings(db_path=str(tmp_path / "app.db"), storage_dir=str(tmp_path / "objects"),
                  public_base_url="http://testserver", limits_path=str(limits))
     s.chunk_size = 1024  # small parts so multipart tests use tiny payloads
+    s.min_part_size, s.max_part_size = 512, 8192
     s.max_file_size = 64 * 1024
     set_settings(s)
     fake = clock.FakeClock()
@@ -124,6 +133,9 @@ def env(tmp_path: Path, monkeypatch):
     db.init_db()
     from fileuploader.api import create_app
     with TestClient(create_app(run_workers=False)) as client:
+        # The mock processor delivers its webhooks to our endpoint through the test client.
+        adapters.get().processor.sender = lambda body, headers: client.post(
+            "/webhooks/processor", content=body, headers=headers).status_code
         yield Env(tmp_path, s, fake, client)
     clock.set_clock(clock.Clock())
     adapters.reset()

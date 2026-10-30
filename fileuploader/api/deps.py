@@ -11,7 +11,7 @@ from fastapi.responses import JSONResponse
 
 from .. import clock, db, ratelimit
 from ..config import get_settings
-from ..errors import ApiError
+from ..errors import ApiError, fix_for
 from ..ids import sha256_hex
 
 
@@ -91,8 +91,18 @@ def load_file(conn: sqlite3.Connection, request: Request, file_id: str) -> sqlit
     return f
 
 
-def part_count(size: int) -> int:
-    return max(1, math.ceil(size / get_settings().chunk_size))
+def part_size_for(size: int, requested: int | None = None) -> int:
+    """The client may pick the part size (adaptive chunks); never more than 10,000 parts."""
+    s = get_settings()
+    return max(requested or s.chunk_size, math.ceil(size / s.max_parts))
+
+
+def file_part_size(f: sqlite3.Row) -> int:
+    return f["part_size"] or part_size_for(f["size_bytes"])
+
+
+def part_count(size: int, part_size: int) -> int:
+    return max(1, math.ceil(size / part_size))
 
 
 def upload_mode(size: int) -> str:
@@ -100,17 +110,25 @@ def upload_mode(size: int) -> str:
 
 
 def file_view(f: sqlite3.Row, confirmed_bytes: int | None = None) -> dict:
+    """`upload_pct` and `processing_pct` are the two segments of the file's combined bar;
+    after a refresh this snapshot restores both."""
+    uploaded = f["uploaded_at"] is not None or f["status"] == "completed"
+    ps = file_part_size(f)
     out = {
         "id": f["id"], "batch_id": f["batch_id"], "client_file_id": f["client_file_id"], "name": f["name"],
-        "size_bytes": f["size_bytes"], "sha256": f["sha256"], "status": f["status"], "stage": f["stage"],
-        "progress_pct": f["progress_pct"], "attempts": f["attempts"], "seq": f["last_seq"],
-        "upload": {"mode": upload_mode(f["size_bytes"]), "part_size": get_settings().chunk_size,
-                   "part_count": part_count(f["size_bytes"])},
+        "size_bytes": f["size_bytes"], "sha256": f["sha256"], "fingerprint": f["fingerprint"],
+        "status": f["status"], "stage": f["stage"], "progress_pct": f["progress_pct"],
+        "upload_pct": 100.0 if uploaded else f["progress_pct"],
+        "processing_pct": f["progress_pct"] if uploaded else 0.0,
+        "processing_estimate_ms": f["processing_estimate_ms"],
+        "attempts": f["attempts"], "seq": f["last_seq"],
+        "upload": {"mode": upload_mode(f["size_bytes"]), "part_size": ps, "part_count": part_count(f["size_bytes"], ps),
+                   "dedupe_candidate": f["dedup_candidate"] is not None},
         "error": None, "dedup_of": f["dedup_of"],
     }
     if f["error_code"]:
         out["error"] = {"code": f["error_code"], "message": f["error_message"],
-                        "retryable_by_user": bool(f["retryable_by_user"])}
+                        "retryable_by_user": bool(f["retryable_by_user"]), "fix": fix_for(f["error_code"])}
     if f["status"] == "completed":
         out["result_url"] = f"/files/{f['id']}/result"
     if confirmed_bytes is not None:

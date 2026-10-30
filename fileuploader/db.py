@@ -21,6 +21,7 @@ CREATE TABLE IF NOT EXISTS batches (
     user_id         TEXT NOT NULL,
     idempotency_key TEXT NOT NULL,
     last_seq        INTEGER NOT NULL DEFAULT 0,
+    watched_until   REAL,             -- an SSE stream is open: this batch's jobs go in the interactive lane
     created_at      REAL NOT NULL,
     UNIQUE (user_id, idempotency_key)
 );
@@ -32,7 +33,8 @@ CREATE TABLE IF NOT EXISTS files (
     client_file_id    TEXT NOT NULL,
     name              TEXT NOT NULL,
     size_bytes        INTEGER NOT NULL,
-    sha256            TEXT NOT NULL,
+    sha256            TEXT,             -- may arrive only at complete (hashed while uploading)
+    fingerprint       TEXT,             -- size + hash of first and last 1 MB, for pre-upload dedupe
     status            TEXT NOT NULL,
     stage             TEXT,
     progress_pct      REAL NOT NULL DEFAULT 0,
@@ -43,8 +45,13 @@ CREATE TABLE IF NOT EXISTS files (
     s3_key            TEXT,
     s3_upload_id      TEXT,
     upload_mode       TEXT,
+    part_size         INTEGER,
     dedup_of          TEXT,
+    dedup_candidate   TEXT,             -- fingerprint hit, confirmed by the full hash at complete
     result_json       TEXT,
+    process_result_key TEXT,            -- results/<file_id>/process.json
+    processing_estimate_ms INTEGER,
+    uploaded_at       REAL,
     last_seq          INTEGER NOT NULL DEFAULT 0,
     version           INTEGER NOT NULL DEFAULT 0,
     created_at        REAL NOT NULL,
@@ -52,6 +59,7 @@ CREATE TABLE IF NOT EXISTS files (
     UNIQUE (batch_id, client_file_id)
 );
 CREATE INDEX IF NOT EXISTS files_user_sha ON files (user_id, sha256, status);
+CREATE INDEX IF NOT EXISTS files_user_fp ON files (user_id, fingerprint, status);
 
 CREATE TABLE IF NOT EXISTS file_parts (
     file_id     TEXT NOT NULL REFERENCES files(id),
@@ -71,18 +79,46 @@ CREATE TABLE IF NOT EXISTS jobs (
     batch_id     TEXT NOT NULL,
     user_id      TEXT NOT NULL,
     stage        TEXT NOT NULL,
-    status       TEXT NOT NULL,      -- queued | running | done | waiting_vendor | failed | dead | cancelled
+    status       TEXT NOT NULL,      -- queued | running | polling | done | waiting_vendor | failed | dead | skipped | cancelled
     attempt      INTEGER NOT NULL DEFAULT 0,
     next_run_at  REAL NOT NULL,
     locked_until REAL,
     lease_id     TEXT,             -- current lease holder; guards every job update
     last_error   TEXT,             -- JSON error chain
     result_json  TEXT,
+    started_at   REAL,             -- first claim; for stage duration samples
+    -- async vendor jobs (process stage): stored before the worker acks the submit
+    vendor_job_id         TEXT,
+    vendor_status         TEXT,    -- queued | running | done | failed
+    vendor_progress       REAL,    -- 0-100, as reported or estimated
+    vendor_queue_position INTEGER,
+    vendor_updated_at     REAL,    -- vendor time of the newest status applied
+    submitted_at          REAL,
+    polls                 INTEGER NOT NULL DEFAULT 0,
+    generation            INTEGER NOT NULL DEFAULT 0,  -- bumped when a failed vendor job is retried
     created_at   REAL NOT NULL,
     updated_at   REAL NOT NULL,
     UNIQUE (file_id, stage)
 );
 CREATE INDEX IF NOT EXISTS jobs_ready ON jobs (stage, status, next_run_at);
+CREATE INDEX IF NOT EXISTS jobs_vendor_job ON jobs (vendor_job_id);
+
+-- Webhook event ids already applied (dedupe).
+CREATE TABLE IF NOT EXISTS webhook_events (
+    event_id    TEXT PRIMARY KEY,
+    vendor      TEXT NOT NULL,
+    received_at REAL NOT NULL
+);
+
+-- Stage duration samples behind the rolling p50 estimates.
+CREATE TABLE IF NOT EXISTS stage_samples (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    stage      TEXT NOT NULL,
+    bucket     TEXT NOT NULL,      -- <family>:<size bucket>
+    duration_s REAL NOT NULL,
+    ts         REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS stage_samples_sb ON stage_samples (stage, bucket, ts);
 
 CREATE TABLE IF NOT EXISTS dlq (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -158,6 +194,23 @@ CREATE TABLE IF NOT EXISTS vendor_call_log (
     is_retry INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS vendor_call_log_vt ON vendor_call_log (vendor, ts);
+
+-- State of the mock processing vendor (stands in for that service's own storage;
+-- kept here so API and worker processes see the same jobs).
+CREATE TABLE IF NOT EXISTS mock_processor_jobs (
+    job_id          TEXT PRIMARY KEY,
+    idempotency_key TEXT NOT NULL UNIQUE,
+    file_id         TEXT NOT NULL,
+    name            TEXT NOT NULL,
+    created_at      REAL NOT NULL,
+    last_sent       TEXT,              -- last state a webhook was generated for
+    finished        INTEGER NOT NULL DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS mock_processor_webhooks (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    deliver_at REAL NOT NULL,
+    body       TEXT NOT NULL
+);
 """
 
 
@@ -177,6 +230,9 @@ def init_db() -> None:
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
     conn = connect()
     try:
+        cols = {r["name"] for r in conn.execute("PRAGMA table_info(files)")}
+        if cols and "fingerprint" not in cols:
+            raise RuntimeError(f"{path} was created by an older schema; delete it (`make clean`) and restart.")
         conn.executescript(SCHEMA)
     finally:
         conn.close()

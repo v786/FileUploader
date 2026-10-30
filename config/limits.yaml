@@ -12,3 +12,7 @@ outbound:
     - { rate: 0.27778, burst: 1000, name: hourly }   # 1,000/hour
   thumbnailer:
     - { rate: 30, burst: 30 }                        # 30 req/s
+  processor:                                         # processing API — submits
+    - { rate: 20, burst: 40 }                        # 20 req/s, burst 40
+  processor_poll:                                    # processing API — status polls, separate bucket
+    - { rate: 30, burst: 30 }                        # 30 req/s

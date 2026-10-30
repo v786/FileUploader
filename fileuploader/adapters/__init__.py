@@ -6,7 +6,7 @@ from dataclasses import dataclass
 
 from ..config import get_settings
 from .object_store import LocalObjectStore
-from .vendors import FaultStore, MockExtractor, MockScanner, MockThumbnailer
+from .vendors import FaultStore, MockExtractor, MockProcessor, MockScanner, MockThumbnailer
 
 
 @dataclass
@@ -16,9 +16,11 @@ class Adapters:
     scanner: MockScanner
     extractor: MockExtractor
     thumbnailer: MockThumbnailer
+    processor: MockProcessor
 
     def vendor(self, name: str):
-        return {"scanner": self.scanner, "extractor": self.extractor, "thumbnailer": self.thumbnailer}[name]
+        return {"scanner": self.scanner, "extractor": self.extractor, "thumbnailer": self.thumbnailer,
+                "processor": self.processor}[name]
 
 
 _adapters: Adapters | None = None
@@ -32,8 +34,10 @@ def build() -> Adapters:
         raise NotImplementedError(f"VENDOR_MODE={s.vendor_mode!r}: no live adapters configured yet")
     store = LocalObjectStore(s.storage_dir, s.bucket, s.public_base_url, s.signing_secret)
     faults = FaultStore(os.path.join(s.storage_dir, "..", "mock_faults.json"))
+    processor = MockProcessor(faults, store, s.processor_webhook_secret,
+                              f"{s.public_base_url.rstrip('/')}/webhooks/processor")
     return Adapters(store, faults, MockScanner(faults, store), MockExtractor(faults, store),
-                    MockThumbnailer(faults, store))
+                    MockThumbnailer(faults, store), processor)
 
 
 def get() -> Adapters:

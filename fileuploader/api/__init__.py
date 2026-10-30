@@ -16,7 +16,7 @@ from .. import adapters, db, ratelimit
 from ..errors import ApiError
 from ..log import log
 
-PUBLIC_PREFIXES = ("/mock-s3", "/__faults", "/admin", "/health", "/docs", "/openapi.json")
+PUBLIC_PREFIXES = ("/mock-s3", "/__faults", "/admin", "/webhooks", "/health", "/docs", "/openapi.json")
 
 
 def _error_response(err: ApiError, request: Request, headers: dict | None = None) -> JSONResponse:
@@ -95,9 +95,10 @@ def create_app(run_workers: bool = False) -> FastAPI:
     def health():
         return {"ok": True}
 
-    from . import admin, mock_s3, routes, sse
+    from . import admin, mock_s3, routes, sse, webhooks
     app.include_router(routes.router)
     app.include_router(sse.router)
+    app.include_router(webhooks.router)
     app.include_router(admin.router)
     app.include_router(mock_s3.router)
     return app

@@ -4,6 +4,9 @@ Every event carries a monotonic per-batch `seq` (also the SSE id). On
 reconnect the client sends Last-Event-ID; we replay from the event stream
 (kept 1 hour) or, if that is gone, send a `snapshot` of the whole batch. The
 client applies an event only if its seq is newer, so replays are harmless.
+
+An open stream also marks the batch as watched, which puts its jobs in the
+interactive lane ahead of bulk work (see worker.claim).
 """
 from __future__ import annotations
 
@@ -13,7 +16,7 @@ import json
 from fastapi import APIRouter, Request
 from fastapi.responses import StreamingResponse
 
-from .. import db, events
+from .. import clock, db, events
 from ..config import get_settings
 from ..errors import ApiError
 from .deps import user_id
@@ -26,6 +29,12 @@ HEARTBEAT_S = 15.0
 
 def _frame(seq: int, type_: str, data: dict) -> str:
     return f"id: {seq}\nevent: {type_}\ndata: {json.dumps(data)}\n\n"
+
+
+def _watch(batch_id: str) -> None:
+    with db.tx() as conn:
+        conn.execute("UPDATE batches SET watched_until = ? WHERE id = ?",
+                     (clock.now() + get_settings().watch_ttl_s, batch_id))
 
 
 def _snapshot(batch_id: str) -> tuple[int, str]:
@@ -43,8 +52,11 @@ async def stream(batch_id: str, request: Request, last_event_id: int | None = No
     header = request.headers.get("Last-Event-ID")
     resume_from = int(header) if header and header.isdigit() else last_event_id
     poll = get_settings().poll_interval_s
+    rewatch_s = get_settings().watch_ttl_s / 3
 
     async def gen():
+        await asyncio.to_thread(_watch, batch_id)
+        watched = 0.0
         yield "retry: 2000\n\n"
         if resume_from is not None and events.can_replay_from(batch_id, resume_from):
             last = resume_from
@@ -66,6 +78,10 @@ async def stream(batch_id: str, request: Request, last_event_id: int | None = No
                 return
             await asyncio.sleep(poll)
             idle += poll
+            watched += poll
+            if watched >= rewatch_s:
+                watched = 0.0
+                await asyncio.to_thread(_watch, batch_id)
             if idle >= HEARTBEAT_S:
                 idle = 0.0
                 yield ": keep-alive\n\n"

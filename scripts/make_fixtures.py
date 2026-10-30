@@ -31,6 +31,7 @@ def main() -> None:
     (OUT / "empty.txt").write_bytes(b"")
     (OUT / "not-allowed.exe").write_bytes(b"MZ\x90\x00")
     with open(OUT / "multipart-20mb.zip", "wb") as f:
+        f.write(b"PK\x03\x04")  # type is checked by content: a zip starts with its magic bytes
         block = os.urandom(1024 * 1024)
         for _ in range(20):
             f.write(block)

@@ -14,11 +14,15 @@ def test_error_contract_shape(env):
 
 
 def test_multipart_upload_end_to_end(env):
-    data = bytes(range(256)) * 10  # 2560 bytes -> 3 parts of 1 KiB
+    data = (b"%PDF" + bytes(range(252))) * 10  # 2560 bytes -> 3 parts of 1 KiB
     b = env.create_batch([spec("report.pdf", data)])
     f = b["files"][0]
-    assert f["status"] == "pending" and f["upload"] == {"mode": "multipart", "part_size": 1024, "part_count": 3,
-                                                       "confirmed_bytes": 0}
+    # One call to start: the multipart upload exists and the first parts are already signed.
+    start = f["upload"].pop("start")
+    assert f["status"] == "uploading" and f["upload"] == {"mode": "multipart", "part_size": 1024, "part_count": 3,
+                                                         "dedupe_candidate": False, "confirmed_bytes": 0}
+    assert start["upload_id"] and sorted(start["urls"]) == ["1", "2", "3"]
+    assert f["processing_estimate_ms"] > 0 and f["upload_pct"] == 0 and f["processing_pct"] == 0
     r = env.upload(f, data)
     assert r.status_code == 200, r.text
     assert r.json()["status"] == "uploaded"
@@ -76,12 +80,13 @@ def test_idempotency_in_flight_returns_409(env):
     files = [spec("a.txt", b"abc")]
     import json as _json
 
+    from fileuploader.api.routes import BatchIn
     from fileuploader.ids import sha256_hex
+    body = _json.dumps(BatchIn(files=files).model_dump(), sort_keys=True)
     with db.tx() as conn:
         conn.execute("INSERT INTO idempotency_keys (user_id, key, request_hash, state, created_at) "
                      "VALUES (?, ?, ?, 'in_flight', ?)",
-                     (env.user, key, sha256_hex("POST", "/batches", _json.dumps({"files": files}, sort_keys=True)),
-                      env.clock.now()))
+                     (env.user, key, sha256_hex("POST", "/batches", body), env.clock.now()))
     r = env.client.post("/batches", json={"files": files}, headers=env.h(**{"Idempotency-Key": key}))
     assert r.status_code == 409 and r.headers["Retry-After"] == "1"
 
@@ -94,8 +99,9 @@ def test_bad_files_are_isolated_not_batch_fatal(env):
     by = {f["client_file_id"]: f for f in b["files"]}
     assert by["big"]["status"] == "failed" and by["big"]["error"]["code"] == "FILE_TOO_LARGE"
     assert by["virus.exe"]["error"]["code"] == "UNSUPPORTED_TYPE"
-    assert by["ok.txt"]["status"] == "pending"
+    assert by["ok.txt"]["status"] == "uploading"
     assert b["summary"]["need_attention"] == 2
+    assert by["big"]["error"]["fix"] == {"action": "split", "label": "Split into parts under 5 GB"}
 
 
 def test_too_many_files(env):
