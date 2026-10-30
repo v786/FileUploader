@@ -15,7 +15,7 @@ export function SelectScreen({ onStarted, onViewUploads }: Props) {
   const selection = items.filter((i) => ["checking", "staged", "invalid"].includes(i.phase));
   const ready = selection.filter((i) => i.phase === "staged");
   const rejected = selection.filter((i) => i.phase === "invalid");
-  const inFlight = items.filter((i) => i.fileId && !["done", "cancelled"].includes(i.phase)).length;
+  const inFlight = items.filter((i) => i.fileId && !["done", "cancelled", "error"].includes(i.phase)).length;
   const totalBytes = ready.reduce((s, i) => s + i.size, 0);
 
   const add = async (make: () => Promise<File[]> | File[]) => {
