@@ -1,7 +1,7 @@
 PY ?= .venv/bin/python
 PORT ?= 8000
 
-.PHONY: install run api worker test chaos fixtures demo clean
+.PHONY: install run api worker test chaos fixtures demo clean web-install web-dev web-test web-build
 
 install:
 	python3 -m venv .venv
@@ -30,3 +30,15 @@ demo: fixtures  ## needs `make run` in another terminal
 
 clean:
 	rm -rf data .pytest_cache
+
+web-install:    ## React frontend deps (needs Node 18+)
+	cd web && npm install
+
+web-dev:        ## demo app on :5173, proxies the API on :$(PORT) (run `make run` too)
+	cd web && API_URL=http://127.0.0.1:$(PORT) npm run dev
+
+web-test:
+	cd web && npm test && npm run typecheck
+
+web-build:
+	cd web && npm run build

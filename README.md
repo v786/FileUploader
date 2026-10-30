@@ -1,4 +1,4 @@
-# Multi-File Upload & Processing Service — Python + SQLite backend
+# Multi-File Upload & Processing Service — Python + SQLite backend, React frontend
 
 Backend for the design in `Multi-File Upload & Processing Service — Implementation Doc.md`,
 built with **Python (FastAPI) and SQLite**. S3 and every third-party vendor are mocked, so it
@@ -27,6 +27,29 @@ processor's webhooks — must match the port you run on), `SIGNING_SECRET`, `PRO
 
 The schema changed with the processing API. A database from an older version is refused at
 startup; run `make clean` to start fresh.
+
+## Frontend (`web/`)
+
+A React + TypeScript upload module and a demo app that uses it.
+
+```bash
+make web-install    # once
+make run            # terminal 1: backend on :8000
+make web-dev        # terminal 2: open http://localhost:5173
+make web-test       # unit tests (hashing, validation, progress maths, labels) + typecheck
+```
+
+- **`web/src/upload/` — the reusable module.** Import everything from `src/upload/index.ts`.
+  - `Uploader` is a framework-free engine. It validates by magic bytes before any request, hashes in a Web Worker, and uploads smallest files first.
+  - Multipart PUTs use adaptive part sizes, 4 lanes per file, per-part checksums and re-signing on 403. Resume uses ListParts.
+  - It also handles pause, resume, cancel and "upload next"; offline auto-pause; resume after a reload by re-picking the file (matched by fingerprint); and live progress over SSE with `Last-Event-ID` replay.
+  - React bindings: `UploaderProvider` and the `useUploader`, `useUploadState` and `useWarnBeforeUnload` hooks.
+  - Components can be used separately or as the all-in-one `UploadPanel`: `DropZone`, `FileList`, `FileRow`, `ProgressBar`, `BatchSummary`, `Notices`, `ResumeInterrupted`, `UploadTray`.
+  - Styles are in `upload.css`, `fu-` prefixed, with CSS-variable tokens and a dark mode.
+- **`web/src/demo/` — the demo app.** Three screens: *Choose files* → *Upload* → *Results*. Results has a details dialog.
+  - Buttons generate sample files: good files, files that fail (disguised type, `.exe`, EICAR) and a 200 MB multipart file.
+  - A user switcher.
+  - A **Dev tools** panel that flips the mock vendors' fault profiles (`/__faults`): scanner down, flaky services, slow processor, lost webhooks.
 
 ## How the doc's stack maps here
 
@@ -124,5 +147,6 @@ curl -X DELETE localhost:8000/__faults/scanner   # they resume on their own afte
   - Vendor results are cached in `vendor_calls`.
   - Each event's `seq` is assigned at write time, so re-publishing the outbox can't create duplicate events.
 - **Deviation from the doc**: the doc's multipart checksum is S3's composite checksum. The mock instead streams the assembled object with ranged reads and compares its full SHA-256 to the one the client declared.
-- **Not in this backend**: the doc's client-side UX work (instant previews, smallest-first queue, AIMD parallelism, upload tray, `FileSystemFileHandle` resume, notifications, ETA smoothing). It also leaves out infra-level changes from "Scaling to 100k users": Transfer Acceleration, warm pools, partitioning, PgBouncer, split Redis, multiple relays and KEDA. The backend provides what those need: `upload.start`, `fingerprint` on file views for re-pick matching, client-chosen `part_size`, `fix` on every error, and ListParts-based resume.
+- **Client-side UX** (instant previews, smallest-first queue, upload tray, notifications, ETA smoothing) is in `web/`. The frontend uses fixed lanes rather than AIMD parallelism, and resumes after a reload by re-picking the file rather than via `FileSystemFileHandle`.
+- **Not in this backend**: infra-level changes from "Scaling to 100k users": Transfer Acceleration, warm pools, partitioning, PgBouncer, split Redis, multiple relays and KEDA. The backend provides what those need: `upload.start`, `fingerprint` on file views for re-pick matching, client-chosen `part_size`, `fix` on every error, and ListParts-based resume.
 - **Live adapters**: `VENDOR_MODE=live` raises until real vendors are chosen (an open question in the doc). They plug in behind `ports.py` in `adapters/__init__.py`.
